@@ -1,0 +1,16 @@
+#!/bin/sh
+
+# kill off any lingering proxy's before restarting.
+/etc/init.d/graphite_local_proxy stop
+ps -ef | grep /usr/sbin/graphite_local_proxy | grep -v grep | \
+    awk ' {print $2}' | xargs --no-run-if-empty kill -1
+ps -ef | grep /usr/sbin/graphite_local_proxy | grep -v grep | \
+    awk ' {print $2}' | xargs --no-run-if-empty kill -9
+
+# make sure the pid file is gone.
+/bin/rm -f /var/run/graphite_local_proxy.pid
+
+# restart the local proxy and/or just start it.
+/etc/init.d/graphite_local_proxy start
+
+#DEBHELPER#

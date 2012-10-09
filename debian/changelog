@@ -1,0 +1,4 @@
+graphite-local-proxy (1.0.0-0) unstable; urgency=low
+  * 1st public release to the Graphite project.
+ -- Allan Bailey <abailey@admob.com>  Thu, 12 May 2010 16:00:00 -0800
+

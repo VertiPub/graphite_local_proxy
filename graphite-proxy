@@ -1,0 +1,237 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# -*- mode: python -*-
+
+"""This is a utility for sending metrics to the local proxy.
+
+It accepts lines of metrics on stdin or specified file.
+
+It accepts metric lines of the following 2 forms:
+
+  metric value timestamp
+
+or
+
+  metric value
+
+In the latter case, it adds a timestamp.
+
+It attempts to guarantee delivery to the local proxy, buffering for
+later delivery if necessary.
+
+Author: Allan Bailey, abailey@admob.com
+"""
+
+import sys
+import os
+import time
+from optparse import OptionParser
+import socket
+
+
+def buffer_data(options):
+    """Buffer data into buffer-dir.
+    """
+
+    if not os.path.exists(options.buffer_dir):
+        um = os.umask(0)
+        os.makedirs(options.buffer_dir)
+        os.umask(um)
+
+    filename = '/'.join([options.buffer_dir, options.buffer_file])
+
+    if os.path.exists(filename):
+        # Yowza!
+        sys.stderr.write("buffer file already exists! [%s]\n" % filename)
+        sys.exit(1)
+    try:
+        outfile = open(filename, 'w')
+    except Exception, errmsg:
+        sys.stderr.write("unhandled exception: %s %s" % (
+                errmsg, sys.exc_info()[1]))
+        sys.exit(1)
+
+    for line in options.file:
+        # run filters over line
+        result = run_filters(line)
+        if result:
+            result.append('') # make sure there is always a \n.
+            line = '\n'.join(result)
+            # write to buffer
+            outfile.write(line)
+
+    outfile.close()
+
+
+def run_filters(line):
+    """run a basic metric line validation, and any available filters.
+    """
+    
+    result = []
+    # validate line
+    line = line.strip() # rm whitespace head and tail.
+    tmp = line.split()
+    if len(tmp) < 2 or len(tmp) > 3:
+        # bad line, skip it.
+        return result
+
+    if len(tmp) == 2: # add timestamp
+        tmp.append(str(int(time.time())))
+    line = ' '.join(tmp)
+
+    result.append(line)
+    try:
+        for proc in glp_filters.LIST:
+            try:
+                res = proc(line)
+            except:
+                continue
+            if res:
+                result.append(res)
+    except NameError, er:
+        # glp_filters wasn't imported, so ignore.
+        pass
+    return result
+    
+
+def send_data(filename):
+    """send buffered data to localhost:2003.
+    """
+    sock = socket.socket()
+    try:
+        sock.connect(('localhost', 2003))
+    except:
+        return False
+    try:
+        if os.path.getsize(filename) > 2**20: # 1Mb
+            # send 1 line at a time.
+            for line in open(filename):
+                sock.sendall(line)
+        else:
+            sock.sendall(open(filename).read())
+        sock.close()
+    except:
+        return False
+
+    return True
+
+
+def send_old_data(options):
+    """send old buffered data files to local proxy if possible.
+
+    There can be only 1 process sending, so use a lock file.
+    """
+
+    # check for lockfile and pid. only 1 process sends old data.
+    bufdir = options.buffer_dir
+    lockfile = '%s/.there_can_be_only_one' % bufdir
+    if os.path.exists(lockfile):
+        try:
+            pid = open(lockfile).read()
+            if len(pid) > 0 and os.path.exists('/proc/%s' % pid):
+                return 0
+            else:
+                os.remove(lockfile)
+        except:
+            return 0
+    # try to get lockfile.
+    try:
+        fld = os.open(lockfile, os.O_EXCL | os.O_RDWR | os.O_CREAT)
+        flh = os.fdopen(fld, 'w')
+        # we have the lock.
+        flh.write(str(os.getpid()))
+        flh.close()
+    except: # give up.
+        return 0
+    # iterate over buffered files.
+    try:
+        try:
+            for fln in os.listdir(bufdir):
+                if fln == '.there_can_be_only_one':
+                    continue
+                fln = bufdir + '/' + fln
+                size = os.path.getsize(fln)
+                tdiff = time.time() - os.path.getctime(fln)
+                if size == 0 or tdiff > 23*3600: # 23 hours.
+                    os.remove(fln)
+                    continue
+                if send_data(fln):
+                    os.remove(fln)
+                else:
+                    break
+        except:
+            pass
+    except:
+        try:
+            os.remove(lockfile)
+        except:
+            pass
+
+
+def main(options):
+    "mainly main()."
+
+    # buffer
+    buffer_data(options)
+
+    # fork and return
+    if os.fork():
+        return 0
+
+    # this is the fork. now we try to connect to localhost:2003
+    # if that fails, we're done. buffered data stays.
+    try:
+        buf_file = '/'.join([options.buffer_dir, options.buffer_file])    
+        if send_data(buf_file):
+            os.remove(buf_file)
+        else: # failed. leave buffer file for later send.
+            sys.exit(0)
+        # if localhost:2003 succeeds, we check for backlogged data and
+        # attempt to send it.
+        send_old_data(options)
+    except:
+        pass # silently ignoring errors.
+
+    return 0
+
+
+if __name__ == '__main__':
+    # need to write a parser for the sh based /etc/default config.
+    # or not. 
+    PARSER = OptionParser(version='1.0')
+    PARSER.add_option('--verbose', action='store_true',
+                      help='turn on verbose output.', default=False)
+    PARSER.add_option('--file', action='store', default=None,
+                      help='input file. default: sys.stdin')
+    t = '/var/tmp/graphite_proxy_feed_buffer'
+    PARSER.add_option('--buffer-dir', action='store',
+                      default=t,
+                      help='buffer dir to store buffer files. default: %s' % t)
+    t = 'graphite.data.%s.%s' % (os.getpid(), int(time.time()))
+    PARSER.add_option('--buffer-file', action='store',
+                      default=t,
+                      help='file name to buffer data into. default: %s' % t)
+    t = '/var/lib/graphite/filters'
+    PARSER.add_option('--filters-dir', action='store',
+                      default=t,
+                      help='path to glp filters lib. default: %s' % t)
+
+    # maybe add option to just resend buffered backlog data?
+
+    OPTS, ARGS = PARSER.parse_args(sys.argv[1:])
+
+    if OPTS.file is None:
+        OPTS.file = sys.stdin
+    elif os.path.exists(OPTS.file):
+        OPTS.file = open(OPTS.file)
+    else:
+        PARSER.print_help()
+        sys.exit(1)
+    if os.path.exists(OPTS.filters_dir):
+        sys.path.insert(0, OPTS.filters_dir)
+        try:
+            import glp_filters
+        except ImportError:
+            pass
+
+    sys.exit(main(OPTS))

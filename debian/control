@@ -1,0 +1,19 @@
+Source: graphite-local-proxy
+Section: web
+Priority: optional
+Maintainer: Allan Bailey <abailey@admob.com>
+Build-Depends: debhelper (>= 5.0.38), python-dev (>= 2.3.5-11)
+Standards-Version: 3.7.2
+XS-Python-Version: current, >=2.3
+
+Package: graphite-local-proxy
+Architecture: all
+Depends: ${python:Depends}, python-amqplib (>= 0.6.1)
+Description: localhost:2003 proxy to rabbitMQ for graphite carbon-cache metrics.
+ This package installs a local process that reads from localhost:2003
+ and sends those metrics to a rabbitMQ exchange that the graphite
+ carbon-cache daemon will read from.  The interface script,
+ graphite-proxy, is an interface to localhost:2003 that
+ buffers the data if the local proxy is down and sends the data at the
+ next attempt to send data.
+

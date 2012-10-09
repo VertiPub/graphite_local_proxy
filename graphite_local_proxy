@@ -1,0 +1,372 @@
+#!/usr/bin/env python
+"""Graphite local proxy listens on port 2003 and sends to amqp.
+
+port 2003 is for graphite metrics: metric value timestamp
+   metrics are sent to an amqp server into the 'metrics' fanout exchange.
+
+Author: Allan Bailey, abailey@admob.com
+"""
+import sys
+import os
+import socket
+import SocketServer
+import threading
+import logging
+import logging.config
+import signal
+import time
+import Queue
+
+from amqplib import client_0_8 as amqp
+
+
+# for testing
+AMQP_HOST = os.environ.get('AMQP_HOST', "localhost") # amqplib
+AMQP_PORT = int(os.environ.get('AMQP_PORT', 5672))
+
+AMQP_HOSTPORT = "%s:%s" % (AMQP_HOST, AMQP_PORT)
+
+AMQP_VHOST = os.environ.get('AMQP_VHOST', "/graphite")
+AMQP_USER = os.environ.get('AMQP_USER', "graphite")
+AMQP_PASSWORD = os.environ.get('AMQP_PASSWORD', "graphiteB3m1ne")
+
+# default is the graphite metrics exchange.
+AMQP_GRAPHITE_EXCHANGE = os.environ.get('AMQP_GRAPHITE_EXCHANGE', "metrics")
+
+LOG_CONFIG = os.environ.get('LOG_CONFIG',
+                            "/etc/graphite/graphite_local_proxy_log.conf")
+
+LOCAL_PORT = int(os.environ.get('LOCAL_PORT', 2003))
+LOCAL_HOST = os.environ.get('LOCAL_HOST', "127.0.0.1")
+
+PIDFILE = '/var/run/graphite_local_proxy.pid'
+
+LOGGER = None
+GRAPHITE_Q = None
+MAX_BACKLOG_SIZE = 1000000
+
+# reconnecting interface to the AMQP server.
+# in this case we'll queue into memory until it returns.
+# *NOTE* this could be a problem, so use the MAX_BACKLOG_SIZE.
+class AMQPQueue:
+    """Reconnecting amqplib wrapper.
+    """
+    def __init__(self, qlimit=0, host=AMQP_HOSTPORT, userid=AMQP_USER,
+                 password=AMQP_PASSWORD, virtual_host=AMQP_VHOST,
+                 exchange=None):
+        self._queue = []
+        self.qlimit = qlimit
+        self.host = host
+        self.userid = userid
+        self.password = password
+        self.virtual_host = virtual_host
+        self.exchange = exchange
+        self._failed_connection = False
+        self.conn = None
+        self.chan = None
+
+        self._log = LOGGER
+        # try to reconnect.
+        try:
+            self.mkconn()
+            self.mkchan()
+        except Exception, ermsg:
+            self._log.debug("failed reconnecting. ermsg: %s, type: %s" % (
+                    ermsg, sys.exc_info()[1]))
+            self._failed_connection = True
+
+    def mkconn(self):
+        """make an amqp connection.
+        """
+        try:
+            if self.conn is not None:
+                self.chan.close()
+                self.conn.close()
+        except Exception, errmsg:
+            self._log.debug("mkconn: tried to close conn. errmsg: %s" % errmsg)
+
+        self.conn = amqp.Connection(host=self.host,
+                                    userid=self.userid,
+                                    password=self.password,
+                                    virtual_host=self.virtual_host,
+                                    insist=True)
+        # @AdMob we have an HA pair of rabbitmq servers. we use insist=True
+        # to force the connection and ignore the redirects. currently
+        # amqplib doesn't do anything useful with the redirect.
+        # I mean, it freaks out. :-)
+
+    def mkchan(self, extype='fanout'):
+        """create a channel and bind to the exchange.
+        """
+        self.chan = self.conn.channel()
+        self.chan.exchange_declare(exchange=self.exchange,
+                                   type=extype,
+                                   durable=True, auto_delete=False)
+        self._failed_connection = False
+
+    def _publish(self, line, passthru=False):
+        """publish line to amqp.
+
+        Note that this assumes we're pushing to a 'fanout' type exchange.
+        Another way to push to amqp is to use routing based upon the
+        metric itself.  In that case, you would modify it to
+        add a routing_key property with the metric as the value to 
+        basic_publish.  See example code
+        """
+
+        # @AdMob we just a fanout exchange for carbon to pull metrics from.
+        msg = amqp.Message(line, content_type='text/plain',
+                           delivery_mode=1)
+        self.chan.basic_publish(msg, exchange=self.exchange)
+
+        # if you use another type of exchange, like topic,
+        # break out the metric for the routing key like below:
+
+        # msg = amqp.Message(line, content_type='text/plain',
+        #                    delivery_mode=1)
+        # if not passthru:
+        #     try:
+        #         metric, val, ts = line.split(' ', 3)
+        #         # note: split w/ max=3 will raise ValueError
+        #         # if there are more than 3 fields.
+        #     except ValueError:
+        #         return # line was bad?
+        #     self.chan.basic_publish(msg, exchange=self.exchange,
+        #                             routing_key=metric)
+        #     # NOTE: that we're leaving the message body to still be the
+        #     # incoming metric line of (metric value timestamp)
+        # else:
+        #     # passthru the data w/o routing_key.
+        #     # this is for the AdMob use case of pushing jsob blobs
+        #     # onto a queue.
+        #     self.chan.basic_publish(msg, exchange=self.exchange)
+
+    def publish(self, line, passthru=False):
+        """publish a message/line/blob.
+
+        passthru is a flag to just shove the data on the queue.
+        """
+        try:
+            self._publish(line, passthru)
+        except Exception, ermsg:
+            self._failed_connection = True
+            self._queue.append(line)
+            if self.qlimit > 0 and len(self._queue) > self.qlimit:
+                self._queue.pop(0) # pop oldest off front.
+
+            # try to reconnect.
+            try:
+                self.mkconn()
+                self.mkchan()
+            except Exception:
+                self._failed_connection = True
+
+        # try to republished the items in the QUEUE
+        if not self._failed_connection:
+            while len(self._queue) > 0:
+                line = self._queue.pop()
+                try:
+                    self._publish(line)
+                except:
+                    return # failed again. skip it.
+
+def readlines_by_separator(sock, separator="\n"):
+    """Readlines from a file by a separator, defaults to newline.
+
+    Use case is to read by blocks of lines separated by some fixed
+    separator, like '\n\n' or 'EOM\n' or some such unique string
+    not expected in the block of text.  Similar to perl's $\.
+
+    w/o specifying separator, this behaves the same as file.readline()
+    NOTE: if the last chunk of data does not end in separator, it is still
+    returned.  For the local proxy, we drop the invalid last chunk.
+    """
+
+    bufsize = 8196
+    seplen = len(separator)
+    block = sock.recv(bufsize)
+    while block:
+        where = block.find(separator)
+        if where < 0:
+            moredata = sock.recv(bufsize)
+            if moredata:
+                block += moredata
+                continue
+            # this yields the last block that did not
+            # end in the separator. for local proxy we just
+            # drop it here.
+            #yield block
+            return
+        yield block[:where]
+        where += seplen
+        block = block[where:] 
+        if not block:
+            try:
+                block = sock.recv(bufsize)
+            except socket.error:
+                pass # connection was closed anyway or uncleanly.
+
+
+class GraphiteTCPHandler(SocketServer.BaseRequestHandler):
+    """Handle incoming graphite metrics.
+    """
+
+    allow_reuse_address = True
+
+    def handle(self):
+        "handles 1 connection."
+        for line in readlines_by_separator(self.request):
+            line = self.filter_lines(line)
+            if line:
+                #LOGGER.debug("graphite: publishing line: [%s]" % line)
+                GRAPHITE_Q.put(line)
+
+    def filter_lines(self, line):
+        """filter empty lines, and invalid lines.
+
+        note: as a convience we add a timestamp if one is missing,
+        but don't correct invalid timestamps other than calling int().
+        if int(timestamp) failes, the line is filtered.
+        """
+
+        line = line.strip() # neatness. strip \s* on ends.
+        if len(line) == 0:
+            return ''
+        tmp = line.split(' ', 2)
+        if len(tmp) == 2:
+            # add a timestamp if one wasn't provided.
+            tmp.append(int(time.time()))
+
+        if len(tmp) == 3: # should be...
+            metric, value, timestamp = tmp
+
+            # check that the metric doesn't have a / in it. convert to .
+            if '/' in metric:
+                metric = metric.replace('/', '.')
+
+            # verify the value is a float, and timestamp is an int.
+            try:
+                value = float(value)
+                timestamp = int(timestamp)
+            except:
+                return ''
+
+            line = "%s %s %s" % (metric, value, timestamp)
+            return line
+
+        else: # skip it.
+            return ''
+
+
+def cleanup_exit(signum=None, stack=None):
+    """cleanup on exit/signal catch. removes pidfile.
+    """
+
+    try:
+        if os.path.exists(PIDFILE):
+            if str(os.getpid()) == open(PIDFILE).read().strip():
+                os.remove(PIDFILE)
+            else:
+                LOGGER.warn(
+                    "cleanup_exit: pidfile exists, but not with our pid.")
+    except Exception, errmsg:
+        #LOGGER.debug("caught exception in cleanup_exit: %s" % errmsg)
+        pass
+
+
+def process_queue(amqp=None, q=None, stats_metric=False, passthru=False):
+    """process metrics from Queues in a separate thread.
+    """
+    stats = {}
+    while True:
+        item = q.get()
+        amqp.publish(item, passthru=passthru)
+        if stats_metric:  # only for metrics, not 'logs' exchange.
+            now = int(time.time())
+            bucket = now - now % 60
+            if bucket not in stats:
+                # send previous minute stats and delete.
+                try:
+                    item = stats.popitem() # (ts, value)
+                except KeyError: # initial run.
+                    item = (bucket, 0)
+                tmp = "%s %s %s" % (stats_metric, item[1], item[0])
+                q.put(tmp)
+                stats.setdefault(bucket, 0)
+            stats[bucket] += 1
+
+# used for creating threaded tcp server listening on ports for metrics.
+class ThreadedTCPServer(SocketServer.ThreadingMixIn,
+                        SocketServer.TCPServer):
+    allow_reuse_address = True
+
+
+def main():
+    """mainly this is the main().
+    """
+    global LOGGER, GRAPHITE_Q
+
+    logging.config.fileConfig(LOG_CONFIG)
+    LOGGER = logging.getLogger("graphite_proxy")
+
+    pid = os.getpid() # my pid.
+    if not os.path.exists(PIDFILE):
+        file(PIDFILE, 'w').write("%s" % pid)
+    elif os.path.exists("/proc/%s" % open(PIDFILE).read().strip()):
+        LOGGER.debug("pidfile exists and proxy still running. EXITING.")
+        sys.exit(1)
+    # setup signal handler for cleanup_exit
+    signal.signal(signal.SIGHUP,  cleanup_exit)
+    signal.signal(signal.SIGINT,  cleanup_exit)
+    signal.signal(signal.SIGQUIT, cleanup_exit)
+    signal.signal(signal.SIGTERM, cleanup_exit)
+
+    threads = []
+
+    amqp_GRAPHITE_Q = AMQPQueue(qlimit=MAX_BACKLOG_SIZE,
+                           exchange=AMQP_GRAPHITE_EXCHANGE)
+
+    GRAPHITE_Q = Queue.Queue()
+
+    # @AdMob we found having this metric very useful in tracking down
+    # rogue hosts/scripts/users-unclear-on-the-concept.
+    fqdn = socket.getfqdn()
+    tmp = fqdn.split('.')
+    if len(tmp) == 4:
+        # host.colo.admob.com
+        stats_metric = '1min.glp.metrics_sent.%s.%s' % (tmp[1], tmp[0])
+    else: # just use host name.
+        stats_metric = '1min.glp.metrics_sent.%s' % tmp[0]
+
+    # setup the threads to process the items in the Queues.
+    thd = threading.Thread(target=process_queue,
+                           kwargs={'amqp': amqp_GRAPHITE_Q, 'q': GRAPHITE_Q,
+                                   'stats_metric': stats_metric})
+    thd.setDaemon(True)
+    thd.start()
+    threads.append(thd)
+
+    # setup listener on port 2003.
+    try:
+        server = ThreadedTCPServer((LOCAL_HOST, LOCAL_PORT),
+                                   GraphiteTCPHandler)
+    except socket.error:
+        LOGGER.critical('caught error trying to setup server: %s' % (
+                sys.exc_info()[1]))
+        sys.exit(1)
+
+    LOGGER.info("listener started on %s:%s" % (LOCAL_HOST, LOCAL_PORT))
+    thd = threading.Thread(target=server.serve_forever)
+    thd.setDaemon(True)
+    thd.start()
+    threads.append(thd)
+
+    # wait for threads to exit.
+    for thd in threads:
+        thd.join()
+
+    return 0  # neatness.
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,66 @@
+#!/usr/bin/make -f
+
+#export DH_VERBOSE=1
+
+PACKAGE=graphite-local-proxy
+APP=graphite_local_proxy
+
+DEB_UPSTREAM_VERSION=$(shell dpkg-parsechangelog | sed -rne 's,^Version: ([^-]+).*,\1,p')
+PYVER=$(shell pyversions -vr)
+
+clean:
+	dh_testdir
+	dh_testroot
+	rm -rf build dist
+	rm -f build-*
+	: #python setup.py clean
+	find . -name *\.py[co] -exec rm -f {} \;
+	dh_clean
+
+build:
+
+install:
+	dh_testdir
+	dh_testroot
+	dh_installdirs
+	: #
+	mkdir -p debian/$(PACKAGE)/etc/init.d
+	install graphite_local_proxy.init.d.sh debian/$(PACKAGE)/etc/init.d/$(APP)
+	mkdir -p debian/$(PACKAGE)/etc/cron.d
+	install graphite_local_proxy.cron.d.sh debian/$(PACKAGE)/etc/cron.d/$(APP)
+	mkdir -p debian/$(PACKAGE)/etc/default
+	install graphite_local_proxy.default.sh debian/$(PACKAGE)/etc/default/$(APP)
+	mkdir -p debian/$(PACKAGE)/etc/graphite
+	install graphite_local_proxy_log.conf debian/$(PACKAGE)/etc/graphite/
+	mkdir -p debian/$(PACKAGE)/usr/bin
+	install graphite-proxy debian/$(PACKAGE)/usr/bin
+	mkdir -p debian/$(PACKAGE)/usr/sbin
+	install graphite_local_proxy debian/$(PACKAGE)/usr/sbin/
+	mkdir -p debian/$(PACKAGE)/var/lib/$(APP)
+	install graphite_local_proxy_cron_check debian/$(PACKAGE)/var/lib/$(APP)/
+	mkdir -p debian/$(PACKAGE)/var/lib/$(APP)/eggs
+	: # glp_filters
+	mkdir -p debian/$(PACKAGE)/var/lib/graphite/filters
+	rsync -a --exclude=.svn --exclude=.bzr glp_filters debian/$(PACKAGE)/var/lib/graphite/filters
+
+#
+binary-indep: build install
+	dh_testdir -i
+	dh_testroot -i
+	dh_installchangelogs -i
+	dh_installdocs -i
+	dh_install -i
+	dh_installinit -i
+#	dh_pycentral -i
+	dh_compress -i -X.py
+	dh_fixperms -i
+	dh_installdeb -i
+	dh_gencontrol -i
+	dh_md5sums -i
+	dh_builddeb -i
+
+binary-arch:
+
+binary: binary-indep binary-arch
+
+.PHONY: build clean binary-indep binary-arch binary install configure

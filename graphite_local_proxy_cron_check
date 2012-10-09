@@ -1,0 +1,27 @@
+#!/bin/bash
+
+what=graphite_local_proxy
+pidfile=/var/run/$what.pid
+
+if [ ! -e $pidfile ]
+then
+    echo $pidfile not found.
+    # check for process
+    if [ -z "`ps -ef | grep $what | grep -v cron_check`" ]
+    then
+	# watcherd will raise and alert if it sees CRITICAL: in the log?
+	echo "CRITICAL: $what not found running, restarting."
+    fi
+    /etc/init.d/$what start
+else
+    pid=`cat $pidfile`
+    if [ -z "`ps -p $pid|grep -v ^UID`" -o -z "`ps -fp $pid|grep $what|grep -v cron_check`" ]
+    then
+	echo "CRITICAL: pidfile found, but $pid doesn't seem to be $what, restarting."
+	ps -fp $pid
+	rm -fv $pidfile  # need to remove the pidfile so we start.
+	rm -fv $pipe     # need to clean up old pipe.
+	/etc/init.d/$what start
+    fi
+fi
+
